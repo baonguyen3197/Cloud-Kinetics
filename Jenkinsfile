@@ -5,8 +5,8 @@ pipeline {
         DOCKER_IMAGE = 'index.docker.io/nhqb3197/nhqb-cloud-kinetics:latest'
         GITHUB_CREDENTIALS_ID = 'github-cloud-kinetics'
         DOCKER_CREDENTIALS_ID = 'dockerhub-creds'
-        DOCKERHUB_USERNAME = credentials('dockerhub-creds').username
-        DOCKERHUB_PASSWORD = credentials('dockerhub-creds').password
+        DOCKERHUB_USERNAME = 'nhqb3197'
+        DOCKERHUB_PASSWORD = 'Therookie97!'
     }
 
     stages {
