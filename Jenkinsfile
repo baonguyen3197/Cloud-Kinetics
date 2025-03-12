@@ -9,9 +9,6 @@ pipeline {
         DOCKER_IMAGE = 'index.docker.io/nhqb3197/nhqb-cloud-kinetics:latest'
         GITHUB_CREDENTIALS_ID = 'github-cloud-kinetics'
         DOCKER_CREDENTIALS_ID = 'dockerhub-creds'
-        // ARGOCD_SERVER = '10.10.100.90:32007'
-        // ARGOCD_APP_NAME = 'app-web'
-        // ARGOCD_AUTH_TOKEN = credentials('argocd-cred')
     }
 
     stages {
@@ -27,15 +24,34 @@ pipeline {
             }
         }
 
-        stage('Build & Push with Kaniko') {
+        stage("Build Docker Image") {
             steps {
-                container(name: 'kaniko', shell: '/busybox/sh') {
-                    sh '''#!/busybox/sh
-                    /kaniko/executor --dockerfile `pwd`/Dockerfile --context `pwd` --destination=${DOCKER_IMAGE}
-                    '''
+                script {
+                    sh "docker build -t ${DOCKER_IMAGE} ."
                 }
             }
         }
+
+        stage("Push Docker Image") {
+            steps {
+                script {
+                    withCredentials([string(credentialsId: "${DOCKER_CREDENTIALS_ID}")]) {
+                        // sh "docker login -u ${DOCKERHUB_USERNAME} -p ${DOCKERHUB_PASSWORD}"
+                        sh "docker push ${DOCKER_IMAGE}"
+                    }
+                }
+            }
+        }
+
+        // stage('Build & Push with Kaniko') {
+        //     steps {
+        //         container(name: 'kaniko', shell: '/busybox/sh') {
+        //             sh '''#!/busybox/sh
+        //             /kaniko/executor --dockerfile `pwd`/Dockerfile --context `pwd` --destination=${DOCKER_IMAGE}
+        //             '''
+        //         }
+        //     }
+        // }
         
         // stage('Trigger ArgoCD Sync') {
         //     steps {
