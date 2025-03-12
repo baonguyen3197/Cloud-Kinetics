@@ -1,9 +1,5 @@
 pipeline {
-    agent {
-        kubernetes {
-            yamlFile 'kaniko-builder.yaml'
-        }
-    }
+    agent any
 
     environment {
         DOCKER_IMAGE = 'index.docker.io/nhqb3197/nhqb-cloud-kinetics:latest'
