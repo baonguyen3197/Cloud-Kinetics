@@ -13,7 +13,7 @@ pipeline {
             def imageName = "nhqb3197/nhqb-cloud-kinetics:${env.BUILD_NUMBER}"
             def dockerImage = docker.build(imageName, '-f Dockerfile .')
             dockerImage.push()
-            // dockerImage.push('latest')
+            dockerImage.push('latest')
           }
         }
       }
