@@ -5,8 +5,6 @@ pipeline {
         DOCKER_IMAGE = 'index.docker.io/nhqb3197/nhqb-cloud-kinetics:latest'
         GITHUB_CREDENTIALS_ID = 'github-cloud-kinetics'
         DOCKER_CREDENTIALS_ID = 'dockerhub-creds'
-        DOCKERHUB_USERNAME = 'nhqb3197'
-        DOCKERHUB_PASSWORD = 'Therookie97!'
     }
 
     stages {
@@ -33,8 +31,8 @@ pipeline {
         stage("Push Docker Image") {
             steps {
                 script {
-                    withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS_ID}", usernameVariable: 'DOCKERHUB_USERNAME', passwordVariable: 'DOCKERHUB_PASSWORD')]) {
-                        sh "docker login -u ${DOCKERHUB_USERNAME} -p ${DOCKERHUB_PASSWORD}"
+                    withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS_ID}")]) {
+                        // sh "docker login -u ${DOCKERHUB_USERNAME} -p ${DOCKERHUB_PASSWORD}"
                         sh "docker push ${DOCKER_IMAGE}"
                     }
                 }
