@@ -33,30 +33,10 @@ pipeline {
                 script {
                     withCredentials([usernamePassword(credentialsId: "${DOCKER_CREDENTIALS_ID}")]) {
                         // sh "docker login -u ${DOCKERHUB_USERNAME} -p ${DOCKERHUB_PASSWORD}"
-                        sh "docker push ${DOCKER_IMAGE}"
+                        sh "docker push ${env.DOCKER_IMAGE}"
                     }
                 }
             }
         }
-
-        // stage('Build & Push with Kaniko') {
-        //     steps {
-        //         container(name: 'kaniko', shell: '/busybox/sh') {
-        //             sh '''#!/busybox/sh
-        //             /kaniko/executor --dockerfile `pwd`/Dockerfile --context `pwd` --destination=${DOCKER_IMAGE}
-        //             '''
-        //         }
-        //     }
-        // }
-        
-        // stage('Trigger ArgoCD Sync') {
-        //     steps {
-        //         withCredentials([string(credentialsId: 'argocd-cred', variable: 'ARGOCD_AUTH_TOKEN')]) {
-        //             sh """
-        //             curl -s -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${ARGOCD_AUTH_TOKEN}" -d '{"syncOptions": ["Force=true", "Replace=true"]}' http://${ARGOCD_SERVER}/api/v1/applications/${ARGOCD_APP_NAME}/sync
-        //             """
-        //         }
-        //     }
-        // }
     }
 }
