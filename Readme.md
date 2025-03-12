@@ -1,7 +1,10 @@
 ## --- Activate the Virtual Environment --- ##
 ```
-
-.\.venv\Scripts\Activate.ps1
-
+Windows:
+    .\.venv\Scripts\Activate.ps1
 ```
 
+```
+Linux:
+    source ./venv/bin/activate
+```
