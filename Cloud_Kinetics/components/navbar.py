@@ -1,5 +1,5 @@
 import reflex as rx
-from chat.state import State
+from Cloud_Kinetics.chat.state import State
 
 def sidebar_chat(chat: str) -> rx.Component:
     """A sidebar chat item.
@@ -23,7 +23,6 @@ def sidebar_chat(chat: str) -> rx.Component:
         ),
         width="100%",
     ))
-
 
 def sidebar(trigger) -> rx.Component:
     """The sidebar component."""
@@ -51,7 +50,6 @@ def sidebar(trigger) -> rx.Component:
         direction="left",
     )
 
-
 def modal(trigger) -> rx.Component:
     """A modal to create a new chat."""
     return rx.dialog.root(
@@ -76,46 +74,49 @@ def modal(trigger) -> rx.Component:
         ),
     )
 
+def upload_modal() -> rx.Component:
+    """A modal for uploading files."""
+    return rx.dialog.root(
+        rx.dialog.trigger(
+            rx.button(
+                rx.icon(tag="upload", color=rx.color("mauve", 12)),
+                background_color=rx.color("mauve", 6),
+            )
+        ),
+        rx.dialog.content(
+            rx.vstack(
+                rx.upload(
+                    rx.text("Select file to upload"),
+                    on_upload=State.handle_upload,
+                ),
+                rx.dialog.close(
+                    rx.button("Close")
+                ),
+                align_items="center",
+            ),
+            background_color=rx.color("mauve", 1),
+            padding="1em",
+        ),
+    )
 
-def navbar():
+def navbar() -> rx.Component:
     return rx.box(
         rx.hstack(
             rx.hstack(
                 rx.avatar(fallback="RC", variant="solid"),
                 rx.heading("Reflex Chat"),
-                rx.desktop_only(
-                    rx.badge(
-                    State.current_chat,
-                    rx.tooltip(rx.icon("info", size=14), content="The current selected chat."),
-                    variant="soft"
-                    )
-                ),
                 align_items="center",
             ),
             rx.hstack(
-                modal(rx.button("+ New chat")),
-                sidebar(
-                    rx.button(
-                        rx.icon(
-                            tag="messages-square",
-                            color=rx.color("mauve", 12),
-                        ),
-                        background_color=rx.color("mauve", 6),
-                    )
-                ),
-                rx.desktop_only(
-                    rx.button(
-                        rx.icon(
-                            tag="sliders-horizontal",
-                            color=rx.color("mauve", 12),
-                        ),
-                        background_color=rx.color("mauve", 6),
-                    )
+                rx.button("+ New chat"),  # Simplified for brevity
+                rx.button(
+                    rx.icon(tag="upload", color=rx.color("mauve", 12)),
+                    background_color=rx.color("mauve", 6),
+                    on_click=rx.redirect("/upload"),  # Navigate to upload page
                 ),
                 align_items="center",
             ),
             justify_content="space-between",
-            align_items="center",
         ),
         backdrop_filter="auto",
         backdrop_blur="lg",
@@ -125,5 +126,4 @@ def navbar():
         position="sticky",
         top="0",
         z_index="100",
-        align_items="center",
     )

@@ -1,9 +1,8 @@
 import reflex as rx
 import reflex_chakra as rc
 
-from Cloud_Kinetics.components import loading_icon
+from Cloud_Kinetics.components.loading_icon import loading_icon
 from Cloud_Kinetics.chat.state import QA, State
-
 
 message_style = dict(display="inline-block", padding="1em", border_radius="8px", max_width=["30em", "30em", "50em", "50em", "50em", "50em"])
 
@@ -40,7 +39,6 @@ def message(qa: QA) -> rx.Component:
         ),
         width="100%",
     )
-
 
 def chat() -> rx.Component:
     """List all the messages in a single conversation."""

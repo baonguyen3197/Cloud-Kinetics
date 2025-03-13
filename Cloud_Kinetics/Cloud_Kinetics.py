@@ -4,6 +4,8 @@ import reflex as rx
 import reflex_chakra as rc
 
 from Cloud_Kinetics.components import chat, navbar
+from Cloud_Kinetics.components.chat import action_bar
+from Cloud_Kinetics.pages.upload_page import upload_page
 
 from rxconfig import config
 
@@ -13,36 +15,12 @@ class State(rx.State):
 
     ...
 
-
-# def index() -> rx.Component:
-#     # Welcome Page (Index)
-#     return rx.container(
-#         rx.color_mode.button(position="top-right"),
-#         rx.vstack(
-#             rx.heading("Welcome to Reflex!", size="9"),
-#             rx.text(
-#                 "Get started by editing ",
-#                 rx.code(f"{config.app_name}/{config.app_name}.py"),
-#                 size="5",
-#             ),
-#             rx.link(
-#                 rx.button("Check out our docs!"),
-#                 href="https://reflex.dev/docs/getting-started/introduction/",
-#                 is_external=True,
-#             ),
-#             spacing="5",
-#             justify="center",
-#             min_height="85vh",
-#         ),
-#         rx.logo(),
-#     )
-
 def index() -> rx.Component:
     """The main app."""
     return rc.vstack(
-        navbar(),
+        navbar.navbar(),
         chat.chat(),
-        chat.action_bar(),
+        action_bar(),
         background_color=rx.color("mauve", 1),
         color=rx.color("mauve", 12),
         min_height="100vh",
@@ -51,4 +29,6 @@ def index() -> rx.Component:
     )
 
 app = rx.App()
-app.add_page(index)
+# app.add_page(index)
+app.add_page(index, route="/")
+app.add_page(upload_page, route="/upload")

@@ -1,2 +1,4 @@
-reflex==0.7.1
-reflex-chakra>=0.6.0
+reflex
+reflex-chakra
+boto3
+python-dotenv
