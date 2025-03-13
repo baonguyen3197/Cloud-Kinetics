@@ -46,25 +46,73 @@ class State(rx.State):
 
     def create_chat(self):
         """Create a new chat."""
-        self.current_chat = self.new_chat_name
-        self.chats[self.new_chat_name] = []
+        if not self.new_chat_name.strip():
+            logger.warning("New chat name is empty.")
+            return
+        chat_name = self.new_chat_name.strip()
+        if chat_name in self.chats:
+            logger.warning(f"Chat '{chat_name}' already exists.")
+            return
+        self.chats[chat_name] = []
+        self.current_chat = chat_name
+        self.new_chat_name = ""  # Reset input field
+        logger.info(f"Created new chat: {chat_name}")
 
     def delete_chat(self):
-        """Delete the current chat."""
+        """Delete the current chat and set the next logical chat as default."""
+        if self.current_chat not in self.chats:
+            logger.warning(f"Attempted to delete non-existent chat: {self.current_chat}")
+            return
+
+        # Get the list of chat titles before deletion
+        chat_titles = list(self.chats.keys())
+        current_index = chat_titles.index(self.current_chat)
+
+        # Delete the current chat
         del self.chats[self.current_chat]
-        if len(self.chats) == 0:
-            self.chats = DEFAULT_CHATS
-        self.current_chat = list(self.chats.keys())[0]
+        logger.info(f"Deleted chat: {self.current_chat}")
+
+        # If no chats remain, create a new 'Intros'
+        if not self.chats:
+            self.chats = DEFAULT_CHATS.copy()  # Use copy to avoid mutating DEFAULT_CHATS
+            self.current_chat = "Intros"
+            logger.info("No chats remain, created new default 'Intros'")
+        else:
+            # Use the updated chat list after deletion
+            remaining_chats = list(self.chats.keys())
+            # If it was the last chat, go to the previous one; otherwise, go to the next or first
+            new_index = min(current_index, len(remaining_chats) - 1) if current_index < len(remaining_chats) else 0
+            self.current_chat = remaining_chats[new_index]
+            logger.info(f"Switched to chat: {self.current_chat}")
+
+        # Force state update to trigger UI re-render
+        self.chats = self.chats
 
     def set_chat(self, chat_name: str):
-        """Set the name of the current chat."""
+        """Set the name of the current chat, fallback to a valid chat or create new if needed."""
+        if chat_name not in self.chats:
+            logger.warning(f"Chat '{chat_name}' does not exist.")
+            if not self.chats:  # If chat history is empty, create a new 'Intros'
+                self.chats = DEFAULT_CHATS.copy()
+                self.current_chat = "Intros"
+                logger.info("Chat history empty, created new default 'Intros'")
+            else:  # Set to the first available chat
+                self.current_chat = list(self.chats.keys())[0]
+                logger.info(f"Chat '{chat_name}' deleted or invalid, switched to: {self.current_chat}")
+            # Force state update
+            self.chats = self.chats
+            return
         self.current_chat = chat_name
+        logger.debug(f"Switched to chat: {chat_name}")
+        # Optional: self.chats = self.chats here if needed, but not necessary for valid chat switch
 
     def reset_session(self):
         """Reset the session."""
-        self.chats = DEFAULT_CHATS
+        self.chats = DEFAULT_CHATS.copy()
         self.current_chat = "Intros"
         self.processing = False
+        logger.info("Session reset to default state.")
+        self.chats = self.chats  # Ensure UI updates
 
     @rx.var(cache=True)
     def chat_titles(self) -> List[str]:
@@ -200,7 +248,6 @@ class State(rx.State):
             self.uploading = False
             return
 
-    @rx.event
     def handle_upload_progress(self, progress: dict):
         """Update progress during upload."""
         logger.debug("Upload progress: %s", progress)

@@ -86,6 +86,6 @@ def upload_page() -> rx.Component:
         spacing="4",
         padding="2em",
         background_color=rx.color("mauve", 1),
-        min_height="100vh",
+        min_height="10vh",
     )
     
