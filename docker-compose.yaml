@@ -1,25 +1,22 @@
 version: '3.8'
 
 services:
-  reflex_app:
+  app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: reflex_app_container
     ports:
+      - "3000:3000"
       - "8000:8000"
     environment:
-      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
-      - S3_OBJECT_NAME=${S3_OBJECT_NAME}
     volumes:
-      - .:/app
+      - .env:/app/.env
+    command: ["reflex", "run", "--env", "prod"]
+    restart: unless-stopped
     networks:
-      - reflex_network
-
-networks:
-  reflex_network:
-    driver: bridge
+      - app-network
