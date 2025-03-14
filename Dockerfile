@@ -18,8 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy only the necessary Reflex app files and directories
 COPY rxconfig.py .
 COPY Cloud_Kinetics/ ./Cloud_Kinetics/
-COPY assets/ ./assets/  # Include assets if you have them; remove if not needed
-COPY .env .  # Copy .env if you use environment variables; adjust as needed
+COPY assets/ ./assets/
+COPY .web/ ./.web/
 
 # Expose the port Reflex runs on (default is 3000 for frontend, 8000 for backend)
 EXPOSE 3000 8000
