@@ -91,6 +91,10 @@ class State(rx.State):
     user_id: str = aws_user_id
     session_ids: Dict[str, str] = {}
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **{k: v for k, v in kwargs.items() if k != 'parent_state'})
+        self.load_session()
+
     def create_chat(self):
         logger.debug(f"Attempting to create chat with name: {self.new_chat_name}")
         if not self.new_chat_name.strip():
@@ -314,16 +318,59 @@ class State(rx.State):
         self.chats = self.chats
         yield
 
-    async def load_session(self):
+    # async def load_session(self):
+    #     logger.debug(f"Loading sessions for user: {self.user_id}")
+    #     try:
+    #         response = chat_table.query(
+    #             KeyConditionExpression="user_id = :uid",
+    #             ExpressionAttributeValues={":uid": self.user_id}
+    #         )
+    #         items = response.get("Items", [])
+    #         logger.debug(f"Query response: {items}")
+    #         if not items:
+    #             self.chats = DEFAULT_CHATS.copy()
+    #             self.current_chat = "Intros"
+    #             session_id = f"Session#{datetime.utcnow().isoformat()}Z"
+    #             chat_table.put_item(
+    #                 Item={
+    #                     "user_id": self.user_id,
+    #                     "session_id": session_id,
+    #                     "chat_name": "Intros",
+    #                     "messages": []
+    #                 }
+    #             )
+    #             self.session_ids["Intros"] = session_id
+    #             logger.info(f"Initialized default 'Intros' session for user {self.user_id}")
+    #         else:
+    #             self.chats = {}
+    #             self.session_ids = {}
+    #             for item in items:
+    #                 chat_name = item["chat_name"]
+    #                 messages = item.get("messages", [])
+    #                 self.chats[chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
+    #                 self.session_ids[chat_name] = item["session_id"]
+    #             self.current_chat = list(self.chats.keys())[0]
+    #             logger.info(f"Loaded sessions for user {self.user_id}: {list(self.chats.keys())}")
+    #         self.chats = self.chats
+    #     except Exception as e:
+    #         logger.error(f"Failed to load sessions from DynamoDB: {str(e)}", exc_info=True)
+    #         self.chats = DEFAULT_CHATS.copy()
+    #         self.current_chat = "Intros"
+
+    def load_session(self):
+        """Load chat sessions from DynamoDB for the current user."""
         logger.debug(f"Loading sessions for user: {self.user_id}")
         try:
+            # Query DynamoDB for all items with the user's ID
             response = chat_table.query(
                 KeyConditionExpression="user_id = :uid",
                 ExpressionAttributeValues={":uid": self.user_id}
             )
             items = response.get("Items", [])
-            logger.debug(f"Query response: {items}")
+            logger.debug(f"DynamoDB query response: {items}")
+
             if not items:
+                # No sessions found, initialize with default "Intros" chat
                 self.chats = DEFAULT_CHATS.copy()
                 self.current_chat = "Intros"
                 session_id = f"Session#{datetime.utcnow().isoformat()}Z"
@@ -336,22 +383,35 @@ class State(rx.State):
                     }
                 )
                 self.session_ids["Intros"] = session_id
-                logger.info(f"Initialized default 'Intros' session for user {self.user_id}")
+                logger.info(f"Created default 'Intros' session for user {self.user_id}")
             else:
+                # Load existing sessions
                 self.chats = {}
                 self.session_ids = {}
                 for item in items:
                     chat_name = item["chat_name"]
+                    session_id = item["session_id"]
                     messages = item.get("messages", [])
-                    self.chats[chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
-                    self.session_ids[chat_name] = item["session_id"]
-                self.current_chat = list(self.chats.keys())[0]
+                    # Avoid duplicate chat names by appending session_id if needed
+                    unique_chat_name = chat_name if chat_name not in self.chats else f"{chat_name}_{session_id}"
+                    self.chats[unique_chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
+                    self.session_ids[unique_chat_name] = session_id
+                    logger.debug(f"Loaded chat '{unique_chat_name}' with {len(messages)} messages")
+                self.current_chat = list(self.chats.keys())[0]  # Set to first chat
                 logger.info(f"Loaded sessions for user {self.user_id}: {list(self.chats.keys())}")
+
+            # Ensure UI updates with loaded data
             self.chats = self.chats
-        except Exception as e:
-            logger.error(f"Failed to load sessions from DynamoDB: {str(e)}", exc_info=True)
+        except ClientError as e:
+            logger.error(f"DynamoDB error: {str(e)}")
             self.chats = DEFAULT_CHATS.copy()
             self.current_chat = "Intros"
+            self.session_ids = {"Intros": f"Session#{datetime.utcnow().isoformat()}Z"}
+        except Exception as e:
+            logger.error(f"Unexpected error loading sessions: {str(e)}")
+            self.chats = DEFAULT_CHATS.copy()
+            self.current_chat = "Intros"
+            self.session_ids = {"Intros": f"Session#{datetime.utcnow().isoformat()}Z"}
 
     async def get_knowledge_base(self) -> str:
         """Retrieve content from all files under the specified S3 prefix."""
