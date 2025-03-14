@@ -1,21 +1,28 @@
-
-# Use the official Python image from the Docker Hub
+# Use the official Python 3.11 slim image as the base
 FROM python:3.11-slim
 
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy the requirements file into the container
+# Install system dependencies (e.g., for boto3,Reflex)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy only the requirements file first (optimization for caching)
 COPY requirements.txt .
 
-# Install the dependencies
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the application code into the container
-COPY . .
+# Copy only the necessary Reflex app files and directories
+COPY rxconfig.py .
+COPY Cloud_Kinetics/ ./Cloud_Kinetics/
+COPY assets/ ./assets/  # Include assets if you have them; remove if not needed
+COPY .env .  # Copy .env if you use environment variables; adjust as needed
 
-# Expose the port the app runs on
-EXPOSE 8000
+# Expose the port Reflex runs on (default is 3000 for frontend, 8000 for backend)
+EXPOSE 3000 8000
 
-# Command to run the application
-CMD ["python", "-m", "reflex", "run"]
+# Command to run the Reflex app
+CMD ["reflex", "run", "--env", "prod"]

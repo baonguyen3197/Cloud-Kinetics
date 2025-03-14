@@ -501,14 +501,13 @@ class State(rx.State):
 
     @rx.event
     async def handle_upload(self, files: List[rx.UploadFile]):
-        """Handle file upload to S3."""
         logger.debug("handle_upload called with files: %s", files)
         if not files:
             logger.warning("No files selected for upload.")
             self.upload_error = "Please select a file before uploading."
             return
         bucket_name = os.getenv("S3_BUCKET_NAME")
-        object_prefix = "nhqb-cloud-kinetics-bucket/"  # Hardcoded for now, or use os.getenv("S3_OBJECT_PREFIX", "nhqb-cloud-kinetics-bucket/")
+        object_prefix = "nhqb-cloud-kinetics-bucket/"  # Hardcoded for now
         if not bucket_name:
             logger.error("S3_BUCKET_NAME not set in environment variables.")
             self.upload_error = "S3 configuration error. Contact support."
@@ -516,19 +515,36 @@ class State(rx.State):
         try:
             file = files[0]  # Only one file due to max_files=1
             clean_filename = file.filename.lstrip("./")  # Remove ./ from filename
-            object_name = f"{object_prefix}{clean_filename}"  # Prepend desired directory
+            object_name = f"{object_prefix}{clean_filename}"
             logger.debug(f"Uploading to S3 with bucket: {bucket_name}, object_name: {object_name}")
+            
+            # Read file content
             content = await file.read()
+            logger.debug(f"File content length: {len(content)} bytes")  # Log content length
+            
+            if not content:
+                logger.error("File content is empty after reading")
+                self.upload_error = "File appears to be empty"
+                self.uploading = False
+                return
+
+            # Use boto3 directly to upload the content
+            s3_client = boto3.client('s3')
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=object_name,
+                Body=content
+            )
+            
             self.total_bytes += len(content)
-            await upload_to_s3(file, bucket_name, object_name)
             self.uploaded_files.append(object_name)
             self.uploaded_files = self.uploaded_files  # Trigger state update
-            logger.info(f"Successfully uploaded {file.filename} to S3 at {object_name}")
+            logger.info(f"Successfully uploaded {file.filename} to S3 at {object_name} with {len(content)} bytes")
             self.upload_error = ""
             self.uploading = False
             return rx.redirect("/")  # Redirect on success
         except Exception as e:
-            logger.error(f"Upload failed: {str(e)}")
+            logger.error(f"Upload failed: {str(e)}", exc_info=True)
             self.upload_error = f"Upload failed: {str(e)}"
             self.uploading = False
             return
