@@ -3,7 +3,8 @@ import reflex as rx
 import boto3
 import logging
 import json
-from botocore.exceptions import NoCredentialsError, PartialCredentialsError
+from datetime import datetime
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError, ClientError
 from dotenv import load_dotenv
 from typing import List, Dict, Any
 from Cloud_Kinetics.chat.upload_to_s3 import upload_to_s3
@@ -13,14 +14,58 @@ from fastapi import UploadFile
 load_dotenv()
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Checking if the AWS credentials are set properly
+logger.debug("Starting state.py execution")
+if not load_dotenv():
+    logger.error("Failed to load .env file - ensure it exists in the project root")
+else:
+    logger.debug(f"Environment variables loaded: AWS_REGION={os.getenv('AWS_DEFAULT_REGION')}")
+
+# Initialize boto3 with static credentials from .env
 try:
-    boto3.client('sts').get_caller_identity()
-except (NoCredentialsError, PartialCredentialsError):
-    raise Exception("Please set AWS credentials properly.")
+    boto3.setup_default_session(
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
+        aws_session_token=os.getenv('AWS_SESSION_TOKEN'),
+        region_name=os.getenv('AWS_DEFAULT_REGION', 'us-west-2')
+    )
+    dynamodb = boto3.resource('dynamodb')
+    chat_table = dynamodb.Table('ChatSession')
+
+    # Fetch caller identity
+    sts_client = boto3.client('sts')
+    identity = sts_client.get_caller_identity()
+    aws_user_id = identity['Arn']
+    logger.debug(f"Fetched AWS identity: {identity}")
+    logger.debug("Successfully initialized boto3 with static credentials")
+except Exception as e:
+    logger.error(f"Failed to initialize boto3 with static credentials: {str(e)}", exc_info=True)
+    raise
+
+# def create_chat_session_table():
+#     try:
+#         dynamodb_client = boto3.client('dynamodb')
+#         dynamodb_client.describe_table(TableName='ChatSession')
+#         logger.debug("Table 'ChatSession' already exists")
+#     except dynamodb_client.exceptions.ResourceNotFoundException:
+#         dynamodb.create_table(
+#             TableName='ChatSession',
+#             KeySchema=[
+#                 {'AttributeName': 'user_id', 'KeyType': 'HASH'},  # Partition key
+#                 {'AttributeName': 'session_id', 'KeyType': 'RANGE'}  # Sort key
+#             ],
+#             AttributeDefinitions=[
+#                 {'AttributeName': 'user_id', 'AttributeType': 'S'},
+#                 {'AttributeName': 'session_id', 'AttributeType': 'S'}
+#             ],
+#             BillingMode='PAY_PER_REQUEST'
+#         )
+#         dynamodb.meta.client.get_waiter('table_exists').wait(TableName='ChatSession')
+#         logger.info("Created 'ChatSession' table in DynamoDB")
+
+# create_chat_session_table()
 
 class QA(rx.Base):
     """A question and answer pair."""
@@ -38,95 +83,275 @@ class State(rx.State):
     question: str = ""
     processing: bool = False
     new_chat_name: str = ""
-    uploaded_files: List[str] = []  # Track S3 object keys of uploaded files
+    uploaded_files: List[str] = []
     upload_error: str = ""
     uploading: bool = False
     progress: int = 0
     total_bytes: int = 0
+    user_id: str = aws_user_id
+    session_ids: Dict[str, str] = {}
 
     def create_chat(self):
-        """Create a new chat."""
+        logger.debug(f"Attempting to create chat with name: {self.new_chat_name}")
         if not self.new_chat_name.strip():
-            logger.warning("New chat name is empty.")
+            logger.warning("New chat name is empty")
             return
         chat_name = self.new_chat_name.strip()
         if chat_name in self.chats:
-            logger.warning(f"Chat '{chat_name}' already exists.")
+            logger.warning(f"Chat '{chat_name}' already exists")
             return
         self.chats[chat_name] = []
         self.current_chat = chat_name
-        self.new_chat_name = ""  # Reset input field
-        logger.info(f"Created new chat: {chat_name}")
+        self.new_chat_name = ""
+        logger.info(f"Created new chat in state: {chat_name}")
+
+        session_id = f"Session#{datetime.utcnow().isoformat()}Z"
+        item = {
+            "user_id": self.user_id,
+            "session_id": session_id,
+            "chat_name": chat_name,
+            "messages": []  # Start with empty message list
+        }
+        try:
+            chat_table.put_item(Item=item)
+            self.session_ids[chat_name] = session_id  # Track session_id
+            logger.info(f"Saved new chat '{chat_name}' to DynamoDB with session_id: {session_id}")
+        except Exception as e:
+            logger.error(f"Failed to save chat to DynamoDB: {str(e)}", exc_info=True)
+            raise
 
     def delete_chat(self):
-        """Delete the current chat and set the next logical chat as default."""
+        logger.debug(f"Attempting to delete chat: {self.current_chat}")
         if self.current_chat not in self.chats:
             logger.warning(f"Attempted to delete non-existent chat: {self.current_chat}")
             return
 
-        # Get the list of chat titles before deletion
         chat_titles = list(self.chats.keys())
         current_index = chat_titles.index(self.current_chat)
 
-        # Delete the current chat
-        del self.chats[self.current_chat]
-        logger.info(f"Deleted chat: {self.current_chat}")
+        try:
+            response = chat_table.query(
+                KeyConditionExpression="user_id = :uid AND begins_with(session_id, :sid)",
+                ExpressionAttributeValues={":uid": self.user_id, ":sid": self.current_chat}
+            )
+            logger.debug(f"Query response for deletion: {response}")
+            for item in response.get("Items", []):
+                if item["chat_name"] == self.current_chat:
+                    chat_table.delete_item(
+                        Key={"user_id": self.user_id, "session_id": item["session_id"]}
+                    )
+                    logger.info(f"Deleted chat '{self.current_chat}' from DynamoDB")
+                    break
+        except Exception as e:
+            logger.error(f"Failed to delete chat from DynamoDB: {str(e)}", exc_info=True)
 
-        # If no chats remain, create a new 'Intros'
+        del self.chats[self.current_chat]
+        logger.info(f"Deleted chat from state: {self.current_chat}")
+
         if not self.chats:
-            self.chats = DEFAULT_CHATS.copy()  # Use copy to avoid mutating DEFAULT_CHATS
+            self.chats = DEFAULT_CHATS.copy()
             self.current_chat = "Intros"
             logger.info("No chats remain, created new default 'Intros'")
+            session_id = f"Intros#{datetime.utcnow().isoformat()}Z"
+            try:
+                chat_table.put_item(
+                    Item={
+                        "user_id": self.user_id,
+                        "session_id": session_id,
+                        "chat_name": "Intros",
+                        "chat_history": [],
+                    }
+                )
+                logger.info("Saved default 'Intros' to DynamoDB")
+            except Exception as e:
+                logger.error(f"Failed to save default 'Intros' to DynamoDB: {str(e)}", exc_info=True)
         else:
-            # Use the updated chat list after deletion
             remaining_chats = list(self.chats.keys())
-            # If it was the last chat, go to the previous one; otherwise, go to the next or first
             new_index = min(current_index, len(remaining_chats) - 1) if current_index < len(remaining_chats) else 0
             self.current_chat = remaining_chats[new_index]
             logger.info(f"Switched to chat: {self.current_chat}")
 
-        # Force state update to trigger UI re-render
         self.chats = self.chats
 
     def set_chat(self, chat_name: str):
-        """Set the name of the current chat, fallback to a valid chat or create new if needed."""
+        logger.debug(f"Attempting to set chat to: {chat_name}")
         if chat_name not in self.chats:
-            logger.warning(f"Chat '{chat_name}' does not exist.")
-            if not self.chats:  # If chat history is empty, create a new 'Intros'
+            logger.warning(f"Chat '{chat_name}' does not exist")
+            if not self.chats:
                 self.chats = DEFAULT_CHATS.copy()
                 self.current_chat = "Intros"
                 logger.info("Chat history empty, created new default 'Intros'")
-            else:  # Set to the first available chat
+                session_id = f"Intros#{datetime.utcnow().isoformat()}Z"
+                try:
+                    chat_table.put_item(
+                        Item={
+                            "user_id": self.user_id,
+                            "session_id": session_id,
+                            "chat_name": "Intros",
+                            "chat_history": [],
+                        }
+                    )
+                    logger.info("Saved default 'Intros' to DynamoDB")
+                except Exception as e:
+                    logger.error(f"Failed to save default 'Intros' to DynamoDB: {str(e)}", exc_info=True)
+            else:
                 self.current_chat = list(self.chats.keys())[0]
                 logger.info(f"Chat '{chat_name}' deleted or invalid, switched to: {self.current_chat}")
-            # Force state update
             self.chats = self.chats
             return
         self.current_chat = chat_name
-        logger.debug(f"Switched to chat: {chat_name}")
-        # Optional: self.chats = self.chats here if needed, but not necessary for valid chat switch
+        logger.info(f"Switched to chat: {chat_name}")
 
     def reset_session(self):
-        """Reset the session."""
+        logger.debug("Attempting to reset session")
         self.chats = DEFAULT_CHATS.copy()
         self.current_chat = "Intros"
         self.processing = False
-        logger.info("Session reset to default state.")
-        self.chats = self.chats  # Ensure UI updates
+        logger.info("Session reset to default state in memory")
+        try:
+            response = chat_table.scan(FilterExpression="user_id = :uid", ExpressionAttributeValues={":uid": self.user_id})
+            logger.debug(f"Scan response for reset: {response}")
+            for item in response.get("Items", []):
+                chat_table.delete_item(Key={"user_id": self.user_id, "session_id": item["session_id"]})
+            session_id = f"Intros#{datetime.utcnow().isoformat()}Z"
+            chat_table.put_item(
+                Item={
+                    "user_id": self.user_id,
+                    "session_id": session_id,
+                    "chat_name": "Intros",
+                    "chat_history": [],
+                }
+            )
+            logger.info(f"Reset DynamoDB session for user {self.user_id}")
+        except Exception as e:
+            logger.error(f"Failed to reset DynamoDB session: {str(e)}", exc_info=True)
+        self.chats = self.chats
 
     @rx.var(cache=True)
     def chat_titles(self) -> List[str]:
-        """Get the list of chat titles."""
-        return list(self.chats.keys())
+        titles = list(self.chats.keys())
+        logger.debug(f"Chat titles retrieved: {titles}")
+        return titles
 
     async def process_question(self, form_data: Dict[str, Any]):
-        """Process the user's question."""
-        question = form_data.get("question", "")
+        logger.debug(f"Processing question: {form_data}")
+        question = form_data.get("question", "").strip()
         if not question:
+            logger.warning("Question is empty, skipping processing")
             return
-        model = self.bedrock_process_question
-        async for value in model(question):
-            yield value
+        qa = QA(question=question, answer="")
+        self.chats[self.current_chat].append(qa)
+        self.processing = True
+        logger.info(f"Added question to chat '{self.current_chat}': {question}")
+        yield
+
+        knowledge_base = await self.get_knowledge_base()
+        prompt = (
+            "You are a helpful assistant. Use the following information as your knowledge base "
+            "to answer the question. If the information below is insufficient, say so and do not "
+            "rely on pretrained data.\n\n"
+            "Human: Here is the knowledge base:\n"
+            f"{knowledge_base}\n\n"
+            f"Now, please answer this question: {question}\n\n"
+            "Assistant:"
+        )
+
+        client = boto3.client("bedrock-runtime", region_name=os.getenv('AWS_DEFAULT_REGION', 'us-west-2'))
+        model_id = "anthropic.claude-v2"
+        body = json.dumps({"prompt": prompt, "max_tokens_to_sample": 2000, "temperature": 0.7})
+
+        try:
+            response = client.invoke_model(
+                modelId=model_id,
+                body=body,
+                contentType="application/json",
+                accept="application/json"
+            )
+            response_body = json.loads(response["body"].read())
+            answer = response_body.get("completion", "").strip()
+            logger.info(f"Received answer from Bedrock: {answer[:50]}...")
+        except Exception as e:
+            logger.error(f"Error calling AWS Bedrock: {str(e)}", exc_info=True)
+            answer = "Sorry, I encountered an error while processing your request."
+
+        self.chats[self.current_chat][-1].answer = answer
+        self.processing = False
+        logger.info(f"Updated chat '{self.current_chat}' with answer")
+
+        # Update DynamoDB by appending to messages
+        session_id = self.session_ids.get(self.current_chat)
+        if not session_id:
+            logger.warning(f"No session_id found for '{self.current_chat}', creating new session")
+            session_id = f"Session#{datetime.utcnow().isoformat()}Z"
+            self.session_ids[self.current_chat] = session_id
+
+        try:
+            # Fetch existing session
+            response = chat_table.get_item(
+                Key={"user_id": self.user_id, "session_id": session_id}
+            )
+            existing_item = response.get("Item", {})
+            existing_messages = existing_item.get("messages", [])
+
+            # Append new message
+            new_message = {"question": qa.question, "answer": qa.answer}
+            existing_messages.append(new_message)
+
+            # Update item
+            chat_table.put_item(
+                Item={
+                    "user_id": self.user_id,
+                    "session_id": session_id,
+                    "chat_name": self.current_chat,
+                    "messages": existing_messages
+                }
+            )
+            logger.info(f"Appended message to session '{session_id}' in DynamoDB")
+        except Exception as e:
+            logger.error(f"Failed to update session in DynamoDB: {str(e)}", exc_info=True)
+            raise
+
+        self.chats = self.chats
+        yield
+
+    async def load_session(self):
+        logger.debug(f"Loading sessions for user: {self.user_id}")
+        try:
+            response = chat_table.query(
+                KeyConditionExpression="user_id = :uid",
+                ExpressionAttributeValues={":uid": self.user_id}
+            )
+            items = response.get("Items", [])
+            logger.debug(f"Query response: {items}")
+            if not items:
+                self.chats = DEFAULT_CHATS.copy()
+                self.current_chat = "Intros"
+                session_id = f"Session#{datetime.utcnow().isoformat()}Z"
+                chat_table.put_item(
+                    Item={
+                        "user_id": self.user_id,
+                        "session_id": session_id,
+                        "chat_name": "Intros",
+                        "messages": []
+                    }
+                )
+                self.session_ids["Intros"] = session_id
+                logger.info(f"Initialized default 'Intros' session for user {self.user_id}")
+            else:
+                self.chats = {}
+                self.session_ids = {}
+                for item in items:
+                    chat_name = item["chat_name"]
+                    messages = item.get("messages", [])
+                    self.chats[chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
+                    self.session_ids[chat_name] = item["session_id"]
+                self.current_chat = list(self.chats.keys())[0]
+                logger.info(f"Loaded sessions for user {self.user_id}: {list(self.chats.keys())}")
+            self.chats = self.chats
+        except Exception as e:
+            logger.error(f"Failed to load sessions from DynamoDB: {str(e)}", exc_info=True)
+            self.chats = DEFAULT_CHATS.copy()
+            self.current_chat = "Intros"
 
     async def get_knowledge_base(self) -> str:
         """Retrieve content from all files under the specified S3 prefix."""
