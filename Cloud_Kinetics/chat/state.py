@@ -91,8 +91,6 @@ def _score_document(question_tokens: List[str], doc_tokens: List[str]) -> float:
     from math import log
     return len(overlap) / (log(len(doc_tokens) + 2))
 
-
-
 # Determine whether Bedrock calls should be allowed in this environment.
 def bedrock_allowed() -> bool:
     """Return False when running against LocalStack or when DISABLE_BEDROCK=1 is set."""

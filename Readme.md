@@ -53,19 +53,16 @@ docker push 000000000000.dkr.ecr.ap-northeast-1.localhost.localstack.cloud:4566/
 ```powershell
 awslocal ecr list-images --repository-name localstack-ecr-repository
 ```
-
-# rebuild image (run in repo root)
-docker build -t nhqb-cloud-kinetics:latest -f Dockerfile .
-
-# tag for LocalStack ECR
-docker tag nhqb-cloud-kinetics:latest 000000000000.dkr.ecr.ap-northeast-1.localhost.localstack.cloud:4566/localstack-ecr-repository:latest
-
-
+### --- Deploy CloudFormation Stacks --- ###
+```powershell
 awslocal cloudformation deploy `
     --stack-name reflex-chatbot-cluster `
     --template-file ".\templates\ecs.infra.yaml" `
     --capabilities CAPABILITY_IAM
+```
 
+### Deploy ECS Service Stack ###
+```powershell
 awslocal cloudformation deploy `
     --stack-name reflex-chatbot-service `
     --template-file "./templates/ecs.service.yaml" `
@@ -74,4 +71,4 @@ awslocal cloudformation deploy `
             ContainerImage=000000000000.dkr.ecr.ap-northeast-1.localhost.localstack.cloud:4566/localstack-ecr-repository:latest `
             ExistingClusterName=reflex-chatbot-cluster `
             ServiceName=reflex-chatbot-service
-
+```
