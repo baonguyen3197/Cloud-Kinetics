@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a Reflex app on AWS Fargate (LocalStack compatible), accessible via a public load balancer.
+
+Parameters:
+  ExistingClusterName:
+    Type: String
+    Default: reflex-chatbot-cluster
+    Description: The name of the existing ECS cluster to deploy into.
+
+  ServiceName:
+    Type: String
+    Default: reflex-app
+    Description: A name for the ECS service.
+
+  ContainerImage:
+    Type: String
+    Default: 000000000000.dkr.ecr.ap-northeast-1.localhost.localstack.cloud:4566/localstack-ecr-repository:latest
+    Description: The ECR image URI for the Reflex app container.
+
+  FrontendPort:
+    Type: Number
+    Default: 3000
+    Description: The container port for the Reflex frontend (usually 3000).
+
+  BackendPort:
+    Type: Number
+    Default: 8000
+    Description: The container port for the Reflex backend (usually 8000).
+
+  ContainerCpu:
+    Type: Number
+    Default: 256
+    Description: How much CPU to allocate to the container (1024 = 1 vCPU).
+
+  ContainerMemory:
+    Type: Number
+    Default: 512
+    Description: Memory (MB) to allocate to the container.
+
+  # Provide names for infra resources so TaskDefinition can point at them
+  S3BucketName:
+    Type: String
+    Default: !Sub "${ExistingClusterName}-chatbot-knowledge-base"
+    Description: S3 bucket name used by the app (created by infra stack)
+
+  ChatTableName:
+    Type: String
+    Default: ChatSession
+    Description: DynamoDB table name used by the app
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: How many container tasks to run.
+
+  Role:
+    Type: String
+    Default: ""
+    Description: Optional IAM role for the task to access AWS services.
+
+  # Network resources will be created automatically so the template does not
+  # rely on hard-coded subnet/security group IDs. This keeps LocalStack
+  # deployments portable and avoids InvalidSubnetID.NotFound errors.
+
+Conditions:
+  HasCustomRole: !Not [ !Equals [!Ref 'Role', ''] ]
+
+Resources:
+  # Task execution role (for pulling image, logging, etc.)
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref ServiceName
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ServiceName
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: !Ref BackendPort
+              HostPort: !Ref BackendPort
+              Protocol: tcp
+            - ContainerPort: !Ref FrontendPort
+              HostPort: !Ref FrontendPort
+              Protocol: tcp
+          Essential: true
+          Environment:
+            - Name: AWS_ACCESS_KEY_ID
+              Value: "test"
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: "test"
+            - Name: AWS_DEFAULT_REGION
+              Value: "ap-northeast-1"
+            - Name: AWS_ENDPOINT_URL
+              Value: "http://localstack:4566"
+            - Name: LOCALSTACK_HOSTNAME
+              Value: "localstack"
+            - Name: FRONTEND_PORT
+              Value: !Ref FrontendPort
+            - Name: BACKEND_PORT
+              Value: !Ref BackendPort
+            - Name: S3_BUCKET_NAME
+              Value: !Ref S3BucketName
+            - Name: CHAT_TABLE_NAME
+              Value: !Ref ChatTableName
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "/ecs/${ExistingClusterName}/${ServiceName}"
+              awslogs-region: ap-northeast-1
+              awslogs-stream-prefix: ecs
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Ref ServiceName
+      Cluster: !Ref ExistingClusterName
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet
+          SecurityGroups:
+            - !Ref ServiceSecurityGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+  # ---------------------------------------------------------
+  # Networking - create a minimal VPC, subnet, route and SG so template
+  # does not require preexisting subnet ids on LocalStack.
+  # ---------------------------------------------------------
+  ServiceVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref ServiceVPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ServiceVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ServiceVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Reflex ECS tasks
+      VpcId: !Ref ServiceVPC
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: 0.0.0.0/0
+
+  # (Container definitions are configured inside the TaskDefinition above)
+
+Outputs:
+  ServiceName:
+    Description: ECS Service Name
+    Value: !Ref ECSService
+
+  TaskDefinitionArn:
+    Description: ARN of the ECS Task Definition
+    Value: !Ref TaskDefinition
+
+  ExecutionRoleArn:
+    Description: ARN of ECS Task Execution Role
+    Value: !GetAtt ECSExecutionRole.Arn
+  VpcId:
+    Description: VPC created for the service (when no existing network provided)
+    Value: !Ref ServiceVPC
+  SubnetId:
+    Description: Public subnet created for the service
+    Value: !Ref PublicSubnet
+  SecurityGroupId:
+    Description: Security group created for the ECS tasks
+    Value: !Ref ServiceSecurityGroup

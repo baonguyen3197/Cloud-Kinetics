@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Deploy Reflex chatbot app to existing ECS Fargate cluster in LocalStack
+  with supporting AWS resources (S3, DynamoDB, Cognito, OpenSearch).
+
+Parameters:
+  ContainerImage:
+    Type: String
+    Default: "000000000000.dkr.ecr.ap-northeast-1.localhost.localstack.cloud:4566/localstack-ecr-repository:latest"
+    Description: ECR image URI for Reflex app container
+  FrontendPort:
+    Type: Number
+    Default: 3000
+  BackendPort:
+    Type: Number
+    Default: 8000
+  ExistingClusterName:
+    Type: String
+    Default: "reflex-chatbot-cluster"
+    Description: Use the already-created ECS cluster name
+  CreateOpenSearch:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true","false"]
+    Description: "Set true to create OpenSearch domain (disable for LocalStack)"
+
+Conditions:
+  CreateOpenSearchCondition: !Equals [ !Ref CreateOpenSearch, "true" ]
+
+Resources:
+  # ---------------------------------------------------------
+  # ECS Cluster
+  # ---------------------------------------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Ref ExistingClusterName
+  # ---------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------
+  FargateTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: reflex-task-exec-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: reflex-task-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonSNSFullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+
+  # ---------------------------------------------------------
+  # ECS Task Definition
+  # ---------------------------------------------------------
+  FargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: reflex-chatbot-task
+      Cpu: 512
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt FargateTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ContainerDefinitions:
+        - Name: reflex-chatbot
+          Image: !Ref ContainerImage
+          PortMappings:
+            - ContainerPort: !Ref BackendPort
+            - ContainerPort: !Ref FrontendPort
+          Essential: true
+          Environment:
+            - Name: AWS_REGION
+              Value: "ap-northeast-1"
+            - Name: CHAT_MEMORY_TABLE
+              Value: !Ref ChatMemoryTable
+            - Name: KNOWLEDGE_BUCKET
+              Value: !Ref KnowledgeBaseBucket
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: ap-northeast-1
+              awslogs-stream-prefix: reflex
+
+  # ---------------------------------------------------------
+  # CloudWatch Logs (simulated in LocalStack)
+  # ---------------------------------------------------------
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 1
+
+  # ---------------------------------------------------------
+  # ECS Service
+  # ---------------------------------------------------------
+  FargateService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ExistingClusterName
+      LaunchType: FARGATE
+      DesiredCount: 1
+      TaskDefinition: !Ref FargateTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: ["subnet-c4d2be58245ff8cb8"]
+          SecurityGroups: ["sg-5ce430595df12d98c"]
+      SchedulingStrategy: REPLICA
+
+  # ---------------------------------------------------------
+  # DynamoDB — Chat Memory
+  # ---------------------------------------------------------
+  ChatMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-chatbot-memory"
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  # ---------------------------------------------------------
+  # S3 Bucket — Markdown Knowledge Base
+  # ---------------------------------------------------------
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-chatbot-knowledge-base"
+
+  KnowledgeBaseBucketNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref KnowledgeBaseBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Function: !GetAtt KnowledgeSyncLambda.Arn
+    DependsOn: KnowledgeSyncLambdaPermission
+
+  # ---------------------------------------------------------
+  # Lambda — Knowledge Sync
+  # ---------------------------------------------------------
+  KnowledgeSyncLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: knowledge-sync
+      Runtime: python3.9
+      Handler: index.handler
+      Role: !GetAtt FargateTaskRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          def handler(event, context):
+              print("Knowledge sync triggered:", event)
+              return {"status": "synced"}
+
+  KnowledgeSyncLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !Ref KnowledgeSyncLambda
+      Principal: "s3.amazonaws.com"
+      SourceArn: !GetAtt KnowledgeBaseBucket.Arn
+
+  # ---------------------------------------------------------
+  # Cognito — Authentication
+  # ---------------------------------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: chatbot-users
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: chatbot-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+
+  CognitoDefaultUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Username: demo-user
+      DesiredDeliveryMediums: []
+      UserAttributes:
+        - Name: email
+          Value: demo-user@example.local
+      MessageAction: SUPPRESS
+
+  # ---------------------------------------------------------
+  # OpenSearch — Knowledge Index (optional)
+  # ---------------------------------------------------------
+  OpenSearchDomain:
+    Condition: CreateOpenSearchCondition
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: chatbot-rag
+      EngineVersion: "OpenSearch_2.11"
+      ClusterConfig:
+        InstanceType: t3.small.search
+        InstanceCount: 1
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 10
+
+Outputs:
+  ECSServiceName:
+    Description: Fargate service for Reflex app
+    Value: !Ref FargateService
+  ECSClusterName:
+    Description: ECS cluster name used
+    Value: !Ref ExistingClusterName
+  ChatMemoryTable:
+    Description: DynamoDB table for chat memory
+    Value: !Ref ChatMemoryTable
+  KnowledgeBaseBucket:
+    Description: S3 bucket for Markdown uploads
+    Value: !Ref KnowledgeBaseBucket
+  CognitoUserPoolId:
+    Description: Cognito user pool for authentication
+    Value: !Ref CognitoUserPool
+  OpenSearchDomain:
+    Description: OpenSearch simulated endpoint
+    Value: !If [ CreateOpenSearchCondition, !Ref OpenSearchDomain, "skipped" ]
+  FargateTaskDefinition:
+    Description: ECS Fargate task definition
+    Value: !Ref FargateTaskDefinition

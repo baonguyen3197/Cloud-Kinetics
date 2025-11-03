@@ -6,3 +6,6 @@ authlib
 werkzeug 
 flask 
 requests
+awscli-local
+fastapi
+uvicorn

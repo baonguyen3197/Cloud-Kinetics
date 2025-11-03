@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from typing import List, Dict, Any
 from Cloud_Kinetics.chat.upload_to_s3 import upload_to_s3
 from fastapi import UploadFile
+import re
 
 # Load environment variables from .env file
 load_dotenv()
@@ -23,26 +24,112 @@ if not load_dotenv():
 else:
     logger.debug(f"Environment variables loaded: AWS_REGION={os.getenv('AWS_DEFAULT_REGION')}")
 
-# Initialize boto3 with static credentials from .env
-try:
-    boto3.setup_default_session(
-        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'),
-        aws_session_token=os.getenv('AWS_SESSION_TOKEN'),
-        region_name=os.getenv('AWS_DEFAULT_REGION', 'us-west-2')
-    )
-    dynamodb = boto3.resource('dynamodb')
-    chat_table = dynamodb.Table('ChatSession')
+"""
+Initialize boto3 using environment variables when available, and fall back to
+LocalStack-friendly defaults. Don't raise on failure to call STS during import
+time — fall back to a safe default identity so the module can be imported in
+containers that can't reach AWS immediately.
+"""
+# Prefer explicit env vars but default to LocalStack 'test' credentials for dev
+aws_access_key = os.getenv('AWS_ACCESS_KEY_ID') or 'test'
+aws_secret_key = os.getenv('AWS_SECRET_ACCESS_KEY') or 'test'
+aws_session_token = os.getenv('AWS_SESSION_TOKEN') or None
+aws_region = os.getenv('AWS_DEFAULT_REGION', 'ap-northeast-1')
+aws_endpoint = os.getenv('AWS_ENDPOINT_URL')  # e.g. http://host.docker.internal:4566
 
-    # Fetch caller identity
-    sts_client = boto3.client('sts')
+# Configure a default session
+boto3.setup_default_session(
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    aws_session_token=aws_session_token,
+    region_name=aws_region,
+)
+
+# Create DynamoDB resource (use endpoint if provided for LocalStack)
+if aws_endpoint:
+    dynamodb = boto3.resource('dynamodb', region_name=aws_region, endpoint_url=aws_endpoint)
+else:
+    dynamodb = boto3.resource('dynamodb', region_name=aws_region)
+
+# Table name can be overridden via env for portability
+chat_table_name = os.getenv('CHAT_TABLE_NAME', 'ChatSession')
+chat_table = dynamodb.Table(chat_table_name)
+
+# Helper factories so all clients/resources consistently use LocalStack endpoint when set
+def make_client(service_name: str, region: str = None, **kwargs):
+    region = region or aws_region
+    endpoint = os.getenv('AWS_ENDPOINT_URL')
+    if endpoint:
+        return boto3.client(service_name, region_name=region, endpoint_url=endpoint, **kwargs)
+    return boto3.client(service_name, region_name=region, **kwargs)
+
+def make_resource(resource_name: str, region: str = None, **kwargs):
+    region = region or aws_region
+    endpoint = os.getenv('AWS_ENDPOINT_URL')
+    if endpoint:
+        return boto3.resource(resource_name, region_name=region, endpoint_url=endpoint, **kwargs)
+    return boto3.resource(resource_name, region_name=region, **kwargs)
+
+
+# Simple in-memory cache of S3 documents to avoid re-reading on every question.
+# Key: bucket/key -> content string
+_s3_doc_cache: Dict[str, str] = {}
+
+def _tokenize(text: str) -> List[str]:
+    # Lowercase, remove non-word characters, split on whitespace
+    tokens = re.findall(r"\w+", text.lower())
+    # Remove very short tokens
+    return [t for t in tokens if len(t) > 2]
+
+def _score_document(question_tokens: List[str], doc_tokens: List[str]) -> float:
+    if not question_tokens or not doc_tokens:
+        return 0.0
+    qset = set(question_tokens)
+    dset = set(doc_tokens)
+    overlap = qset & dset
+    # score by overlap / log(len(doc_tokens)+2) to prefer concise matches
+    from math import log
+    return len(overlap) / (log(len(doc_tokens) + 2))
+
+
+
+# Determine whether Bedrock calls should be allowed in this environment.
+def bedrock_allowed() -> bool:
+    """Return False when running against LocalStack or when DISABLE_BEDROCK=1 is set."""
+    # Explicit disable takes highest precedence
+    if os.getenv("DISABLE_BEDROCK", "0") == "1":
+        return False
+
+    # Allow forcing Bedrock (useful for testing against LocalStack)
+    if os.getenv("FORCE_BEDROCK", "0") == "1":
+        logger.info("FORCE_BEDROCK=1 set — allowing Bedrock calls even when targeting LocalStack")
+        return True
+
+    # By default avoid calling Bedrock when the endpoint looks like LocalStack
+    endpoint = os.getenv("AWS_ENDPOINT_URL", "").lower()
+    if "localstack" in endpoint:
+        return False
+
+    return True
+
+# Attempt to fetch caller identity, but tolerate failures in dev/localstack
+try:
+    if aws_endpoint:
+        sts_client = boto3.client('sts', region_name=aws_region, endpoint_url=aws_endpoint)
+    else:
+        sts_client = boto3.client('sts', region_name=aws_region)
+
     identity = sts_client.get_caller_identity()
-    aws_user_id = identity['Arn']
+    aws_user_id = identity.get('Arn', f"arn:aws:iam::000000000000:root")
     logger.debug(f"Fetched AWS identity: {identity}")
     logger.debug("Successfully initialized boto3 with static credentials")
+except ClientError as e:
+    logger.error(f"Failed to initialize boto3 with static credentials: {e}", exc_info=True)
+    # Fallback identity for LocalStack / dev environments
+    aws_user_id = os.getenv('AWS_USER_ARN', f"arn:aws:iam::000000000000:root")
 except Exception as e:
-    logger.error(f"Failed to initialize boto3 with static credentials: {str(e)}", exc_info=True)
-    raise
+    logger.error(f"Unexpected error while initializing boto3/STS: {e}", exc_info=True)
+    aws_user_id = os.getenv('AWS_USER_ARN', f"arn:aws:iam::000000000000:root")
 
 # def create_chat_session_table():
 #     try:
@@ -118,7 +205,7 @@ class State(rx.State):
         }
         try:
             chat_table.put_item(Item=item)
-            self.session_ids[chat_name] = session_id  # Track session_id
+            self.session_ids[chat_name] = session_id # Store session_id for new chat
             logger.info(f"Saved new chat '{chat_name}' to DynamoDB with session_id: {session_id}")
         except Exception as e:
             logger.error(f"Failed to save chat to DynamoDB: {str(e)}", exc_info=True)
@@ -238,13 +325,15 @@ class State(rx.State):
         return titles
 
     async def process_question(self, form_data: Dict[str, Any]):
+        """Process a submitted question: call Bedrock (or mock), store result in DynamoDB, update state."""
         logger.debug(f"Processing question: {form_data}")
         question = form_data.get("question", "").strip()
         if not question:
             logger.warning("Question is empty, skipping processing")
             return
+
         qa = QA(question=question, answer="")
-        self.chats[self.current_chat].append(qa)
+        self.chats.setdefault(self.current_chat, []).append(qa)
         self.processing = True
         logger.info(f"Added question to chat '{self.current_chat}': {question}")
         yield
@@ -260,102 +349,70 @@ class State(rx.State):
             "Assistant:"
         )
 
-        client = boto3.client("bedrock-runtime", region_name=os.getenv('AWS_DEFAULT_REGION', 'us-west-2'))
-        model_id = "anthropic.claude-v2"
-        body = json.dumps({"prompt": prompt, "max_tokens_to_sample": 2000, "temperature": 0.7})
+        # Call Bedrock (or LocalStack stub) using helper so endpoint is honored
+        if not bedrock_allowed():
+            logger.info("Bedrock disabled or running against LocalStack — using local mock response")
+            # Use a simple local retrieval to return the most relevant excerpt
+            snippet = await self.find_relevant_snippet(question)
+            answer = (
+                "(Local mock) Bedrock is disabled in this environment. "
+                f"Here's the most relevant excerpt I found:\n{snippet}"
+            ).strip()
+        else:
+            try:
+                client = make_client("bedrock-runtime", region=os.getenv('AWS_DEFAULT_REGION', 'ap-northeast-1'))
+                model_id = "anthropic.claude-v2"
+                body = json.dumps({"prompt": prompt, "max_tokens_to_sample": 2000, "temperature": 0.7})
 
-        try:
-            response = client.invoke_model(
-                modelId=model_id,
-                body=body,
-                contentType="application/json",
-                accept="application/json"
-            )
-            response_body = json.loads(response["body"].read())
-            answer = response_body.get("completion", "").strip()
-            logger.info(f"Received answer from Bedrock: {answer[:50]}...")
-        except Exception as e:
-            logger.error(f"Error calling AWS Bedrock: {str(e)}", exc_info=True)
-            answer = "Sorry, I encountered an error while processing your request."
+                response = client.invoke_model(
+                    modelId=model_id,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                response_body = json.loads(response["body"].read())
+                answer = response_body.get("completion", "").strip()
+                logger.info(f"Received answer from Bedrock: {answer[:50]}...")
+            except Exception as e:
+                logger.error(f"Error calling Bedrock/Runtime: {e}", exc_info=True)
+                answer = "Sorry, I encountered an error while processing your request."
 
+        # Update the QA and persist to DynamoDB
         self.chats[self.current_chat][-1].answer = answer
         self.processing = False
         logger.info(f"Updated chat '{self.current_chat}' with answer")
 
-        # Update DynamoDB by appending to messages
         session_id = self.session_ids.get(self.current_chat)
         if not session_id:
-            logger.warning(f"No session_id found for '{self.current_chat}', creating new session")
             session_id = f"Session#{datetime.utcnow().isoformat()}Z"
             self.session_ids[self.current_chat] = session_id
 
         try:
-            # Fetch existing session
-            response = chat_table.get_item(
-                Key={"user_id": self.user_id, "session_id": session_id}
-            )
-            existing_item = response.get("Item", {})
+            existing_item = {}
+            try:
+                resp = chat_table.get_item(Key={"user_id": self.user_id, "session_id": session_id})
+                existing_item = resp.get("Item", {})
+            except Exception:
+                logger.debug("No existing session found; will create a new one")
+
             existing_messages = existing_item.get("messages", [])
+            existing_messages.append({"question": qa.question, "answer": qa.answer})
 
-            # Append new message
-            new_message = {"question": qa.question, "answer": qa.answer}
-            existing_messages.append(new_message)
-
-            # Update item
             chat_table.put_item(
                 Item={
                     "user_id": self.user_id,
                     "session_id": session_id,
                     "chat_name": self.current_chat,
-                    "messages": existing_messages
+                    "messages": existing_messages,
                 }
             )
             logger.info(f"Appended message to session '{session_id}' in DynamoDB")
         except Exception as e:
             logger.error(f"Failed to update session in DynamoDB: {str(e)}", exc_info=True)
-            raise
+            # Don't raise — keep the UI responsive even if DB write fails
 
         self.chats = self.chats
         yield
-
-    # async def load_session(self):
-    #     logger.debug(f"Loading sessions for user: {self.user_id}")
-    #     try:
-    #         response = chat_table.query(
-    #             KeyConditionExpression="user_id = :uid",
-    #             ExpressionAttributeValues={":uid": self.user_id}
-    #         )
-    #         items = response.get("Items", [])
-    #         logger.debug(f"Query response: {items}")
-    #         if not items:
-    #             self.chats = DEFAULT_CHATS.copy()
-    #             self.current_chat = "Intros"
-    #             session_id = f"Session#{datetime.utcnow().isoformat()}Z"
-    #             chat_table.put_item(
-    #                 Item={
-    #                     "user_id": self.user_id,
-    #                     "session_id": session_id,
-    #                     "chat_name": "Intros",
-    #                     "messages": []
-    #                 }
-    #             )
-    #             self.session_ids["Intros"] = session_id
-    #             logger.info(f"Initialized default 'Intros' session for user {self.user_id}")
-    #         else:
-    #             self.chats = {}
-    #             self.session_ids = {}
-    #             for item in items:
-    #                 chat_name = item["chat_name"]
-    #                 messages = item.get("messages", [])
-    #                 self.chats[chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
-    #                 self.session_ids[chat_name] = item["session_id"]
-    #             self.current_chat = list(self.chats.keys())[0]
-    #             logger.info(f"Loaded sessions for user {self.user_id}: {list(self.chats.keys())}")
-    #         self.chats = self.chats
-    #     except Exception as e:
-    #         logger.error(f"Failed to load sessions from DynamoDB: {str(e)}", exc_info=True)
-    #         self.chats = DEFAULT_CHATS.copy()
-    #         self.current_chat = "Intros"
 
     def load_session(self):
         """Load chat sessions from DynamoDB for the current user."""
@@ -371,21 +428,25 @@ class State(rx.State):
 
             if not items:
                 # No sessions found, initialize with default "Intros" chat
-                self.chats = DEFAULT_CHATS.copy()
-                self.current_chat = "Intros"
+                # Don't attempt to initialize Bedrock when running in LocalStack or when disabled
+                if not bedrock_allowed():
+                    logger.debug("Bedrock disabled in this environment; skipping bedrock client init during load_session")
                 session_id = f"Session#{datetime.utcnow().isoformat()}Z"
-                chat_table.put_item(
-                    Item={
-                        "user_id": self.user_id,
-                        "session_id": session_id,
-                        "chat_name": "Intros",
-                        "messages": []
-                    }
-                )
+                self.chats["Intros"] = [QA(question="", answer="")]
                 self.session_ids["Intros"] = session_id
                 logger.info(f"Created default 'Intros' session for user {self.user_id}")
             else:
                 # Load existing sessions
+                self.chats = {}
+                self.session_ids = {}
+                for item in items:
+                    chat_name = item["chat_name"]
+                    session_id = item["session_id"]
+                    messages = item.get("messages", [])
+                    # Avoid duplicate chat names by appending session_id if needed
+                    unique_chat_name = chat_name if chat_name not in self.chats else f"{chat_name}_{session_id}"
+                    self.chats[unique_chat_name] = [QA(question=m["question"], answer=m["answer"]) for m in messages]
+                    self.session_ids[unique_chat_name] = session_id
                 self.chats = {}
                 self.session_ids = {}
                 for item in items:
@@ -415,36 +476,164 @@ class State(rx.State):
 
     async def get_knowledge_base(self) -> str:
         """Retrieve content from all files under the specified S3 prefix."""
-        s3_client = boto3.client('s3')
+        # Build S3 client honoring endpoint (prefer helper so endpoint handling is consistent)
+        s3_client = make_client('s3', region=os.getenv('AWS_DEFAULT_REGION', aws_region))
         bucket_name = os.getenv("S3_BUCKET_NAME")
-        prefix = os.getenv("S3_OBJECT_NAME", "")  # e.g., "nhqb-cloud-kinetics-bucket/"
-        
+        prefix = os.getenv("S3_OBJECT_NAME", "")
+
         if not bucket_name:
             logger.error("S3_BUCKET_NAME not set in environment variables.")
             return "No S3 bucket configured."
+
         if not prefix:
-            logger.warning("S3_OBJECT_NAME not set; fetching from bucket root.")
+            logger.debug("S3_OBJECT_NAME not set; fetching from bucket root.")
 
         knowledge_base = []
-        try:
-            # List all objects under the prefix in the bucket
-            response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=prefix)
-            if 'Contents' not in response:
-                return f"No files found under {prefix} in S3 bucket {bucket_name}."
+        tried_prefixes = []
+        # Try several prefix variants to handle nested folder keys
+        if prefix:
+            tried_prefixes = [prefix, prefix.rstrip('/') + '/']
+        else:
+            tried_prefixes = ['']
 
-            for obj in response['Contents']:
-                object_name = obj['Key']
+        found_keys = []
+        try:
+            for p in tried_prefixes:
+                if p in found_keys:
+                    continue
                 try:
-                    file_response = s3_client.get_object(Bucket=bucket_name, Key=object_name)
-                    content = file_response['Body'].read().decode('utf-8')
-                    knowledge_base.append(f"File: {object_name}\n{content}")
+                    resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=p)
                 except Exception as e:
-                    logger.error(f"Error fetching {object_name} from S3: {e}")
+                    logger.debug(f"list_objects_v2 failed for prefix '{p}': {e}")
+                    continue
+                contents = resp.get('Contents', [])
+                for obj in contents:
+                    k = obj.get('Key')
+                    if k and k not in found_keys:
+                        found_keys.append(k)
+
+            # As a fallback, if no keys found for the prefixes, list all and filter contains
+            if not found_keys:
+                resp = s3_client.list_objects_v2(Bucket=bucket_name)
+                for obj in resp.get('Contents', []):
+                    k = obj.get('Key')
+                    if k and (not prefix or prefix in k):
+                        found_keys.append(k)
+
+            if not found_keys:
+                return f"No files found under '{prefix}' in S3 bucket {bucket_name}."
+
+            for key in found_keys:
+                try:
+                    file_response = s3_client.get_object(Bucket=bucket_name, Key=key)
+                    content = file_response['Body'].read().decode('utf-8', errors='replace')
+                    knowledge_base.append(f"File: {key}\n{content}")
+                except Exception as e:
+                    logger.error(f"Error fetching {key} from S3: {e}")
         except Exception as e:
-            logger.error(f"Error listing objects in S3 bucket {bucket_name} with prefix {prefix}: {e}")
+            logger.error(f"Error accessing S3 bucket {bucket_name} with prefix {prefix}: {e}")
             return "Error accessing S3 bucket."
 
         return "\n\n".join(knowledge_base) if knowledge_base else "No knowledge base available."
+
+    async def find_relevant_snippet(self, question: str, max_chars: int = 800) -> str:
+        """Find the most relevant S3 document for the question and return an excerpt.
+
+        This is a cheap local fallback when Bedrock is disabled. It lists objects in
+        the configured S3 bucket, caches their contents in memory, scores them by
+        simple token overlap with the question, and returns a small excerpt from
+        the best matching document.
+        """
+        bucket_name = os.getenv("S3_BUCKET_NAME")
+        prefix = os.getenv("S3_OBJECT_NAME", "")
+        if not bucket_name:
+            logger.error("S3_BUCKET_NAME not set in environment variables.")
+            return "No S3 bucket configured."
+
+        # Use the consistent client factory (respects AWS_ENDPOINT_URL)
+        s3_client = make_client('s3', region=os.getenv('AWS_DEFAULT_REGION', aws_region))
+
+        # Build candidate key list by trying prefix variants and then a filtered full list
+        candidate_keys = []
+        tried_prefixes = [p for p in ([prefix, prefix.rstrip('/') + '/'] if prefix else ['']) if p]
+
+        try:
+            for p in tried_prefixes:
+                try:
+                    resp = s3_client.list_objects_v2(Bucket=bucket_name, Prefix=p)
+                except Exception as e:
+                    logger.debug(f"list_objects_v2 failed for prefix '{p}': {e}")
+                    continue
+                for obj in resp.get('Contents', []):
+                    k = obj.get('Key')
+                    if k and k not in candidate_keys:
+                        candidate_keys.append(k)
+
+            if not candidate_keys:
+                # Fallback: list all and include keys that contain the prefix as substring
+                resp = s3_client.list_objects_v2(Bucket=bucket_name)
+                for obj in resp.get('Contents', []):
+                    k = obj.get('Key')
+                    if k and (not prefix or prefix in k) and k not in candidate_keys:
+                        candidate_keys.append(k)
+
+            if not candidate_keys:
+                return f"(Local mock) Bedrock is disabled in this environment. No relevant files found in bucket {bucket_name}."
+
+            question_tokens = _tokenize(question)
+            # Detect date-like tokens in the question to boost documents that contain those strings
+            date_matches = re.findall(r"\b(\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}[/-]\d{1,2}[/-]\d{1,2})\b", question)
+
+            scored = []
+            for key in candidate_keys:
+                cache_key = f"{bucket_name}/{key}"
+                if cache_key not in _s3_doc_cache:
+                    try:
+                        file_response = s3_client.get_object(Bucket=bucket_name, Key=key)
+                        content = file_response['Body'].read().decode('utf-8', errors='replace')
+                        _s3_doc_cache[cache_key] = content
+                    except Exception as e:
+                        logger.error(f"Error fetching {key} from S3 for local retrieval: {e}")
+                        _s3_doc_cache[cache_key] = ""
+
+                doc_text = _s3_doc_cache.get(cache_key, "")
+                doc_tokens = _tokenize(doc_text)
+                base_score = _score_document(question_tokens, doc_tokens)
+
+                # Boost if any detected date token appears verbatim in the document
+                boost = 0.0
+                for d in date_matches:
+                    if d in doc_text:
+                        boost += 2.0
+
+                final_score = base_score + boost
+                scored.append((final_score, key))
+
+            # Sort descending
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            best_score, best_key = scored[0]
+
+            # If best score is very small, return top-3 summaries instead of a single tiny match
+            if best_score < 0.05:
+                top_n = [k for s, k in scored[:3] if s > 0]
+                if not top_n:
+                    # No substantive overlap; return a short bucket listing
+                    return f"(Local mock) Bedrock is disabled in this environment. Found files: {', '.join(candidate_keys[:10])}"
+                excerpts = []
+                for k in top_n:
+                    text = _s3_doc_cache.get(f"{bucket_name}/{k}", "").strip()[:max_chars]
+                    excerpts.append(f"File: {k}\n{text}")
+                return "\n\n---\n\n".join(excerpts)
+
+            # Return an excerpt from the best document
+            excerpt_text = _s3_doc_cache.get(f"{bucket_name}/{best_key}", "").strip()
+            excerpt_text = excerpt_text[:max_chars]
+            return f"File: {best_key}\n{excerpt_text}"
+
+        except Exception as e:
+            logger.error(f"Error during local S3 retrieval: {e}")
+            return "Error accessing S3 during local retrieval."
     
     async def bedrock_process_question(self, question: str):
         """Get the response from AWS Bedrock using uploaded resources as knowledge base."""
@@ -467,32 +656,41 @@ class State(rx.State):
             "Assistant:"
         )
 
-        # Initialize the Bedrock Runtime client
-        client = boto3.client("bedrock-runtime", region_name=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
+        # If Bedrock is disabled (LocalStack/dev), return a mock answer to keep UI responsive
+        if not bedrock_allowed():
+            logger.info("Bedrock disabled or running against LocalStack — returning mock answer from bedrock_process_question")
+            snippet = await self.find_relevant_snippet(question)
+            answer = (
+                "(Local mock) Bedrock is disabled in this environment. "
+                f"Here's the most relevant excerpt I found:\n{snippet}"
+            ).strip()
+        else:
+            # Initialize the Bedrock Runtime client using make_client so endpoint_url is honored
+            client = make_client("bedrock-runtime", region=os.getenv('AWS_DEFAULT_REGION', 'us-east-1'))
 
-        # Define the model ID
-        model_id = "anthropic.claude-v2"  # Replace with your desired model ID
+            # Define the model ID
+            model_id = "anthropic.claude-v2"  # Replace with your desired model ID
 
-        # Prepare the request body
-        body = json.dumps({
-            "prompt": prompt,
-            "max_tokens_to_sample": 2000,
-            "temperature": 0.7,
-        })
+            # Prepare the request body
+            body = json.dumps({
+                "prompt": prompt,
+                "max_tokens_to_sample": 2000,
+                "temperature": 0.7,
+            })
 
-        try:
-            # Invoke the Bedrock model
-            response = client.invoke_model(
-                modelId=model_id,
-                body=body,
-                contentType="application/json",
-                accept="application/json"
-            )
-            response_body = json.loads(response["body"].read())
-            answer = response_body.get("completion", "").strip()
-        except Exception as e:
-            logger.error(f"Error calling AWS Bedrock: {e}")
-            answer = "Sorry, I encountered an error while processing your request."
+            try:
+                # Invoke the Bedrock model
+                response = client.invoke_model(
+                    modelId=model_id,
+                    body=body,
+                    contentType="application/json",
+                    accept="application/json"
+                )
+                response_body = json.loads(response["body"].read())
+                answer = response_body.get("completion", "").strip()
+            except Exception as e:
+                logger.error(f"Error calling AWS Bedrock: {e}")
+                answer = "Sorry, I encountered an error while processing your request."
 
         self.chats[self.current_chat][-1].answer = answer
         self.chats = self.chats
@@ -507,7 +705,7 @@ class State(rx.State):
             self.upload_error = "Please select a file before uploading."
             return
         bucket_name = os.getenv("S3_BUCKET_NAME")
-        object_prefix = "nhqb-cloud-kinetics-bucket/"  # Hardcoded for now
+        object_prefix = "nhqb-cloud-kinetics-bucket/"
         if not bucket_name:
             logger.error("S3_BUCKET_NAME not set in environment variables.")
             self.upload_error = "S3 configuration error. Contact support."

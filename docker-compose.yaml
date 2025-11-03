@@ -1,17 +1,13 @@
-version: '3.8'
-
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: nhqb3197/nhqb-cloud-kinetics:16
     ports:
       - "3000:3000"
       - "8000:8000"
     environment:
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN} 
       - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-us-west-2}
       - S3_BUCKET_NAME=${S3_BUCKET_NAME}
     volumes:
@@ -20,3 +16,7 @@ services:
     restart: unless-stopped
     networks:
       - app-network
+
+networks:
+  app-network:
+    driver: bridge
